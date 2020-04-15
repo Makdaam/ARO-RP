@@ -16,9 +16,15 @@ func (mon *Monitor) emitAPIServerHealthzCode() (int, error) {
 		StatusCode(&statusCode).
 		Error()
 
-	mon.emitGauge("apiserver.healthz.code", 1, map[string]string{
-		"code": strconv.FormatInt(int64(statusCode), 10),
-	})
+	if err != nil {
+		mon.emitGauge("apiserver.healthz.code", 1, map[string]string{
+			"code": "0",
+		})
+	} else {
+		mon.emitGauge("apiserver.healthz.code", 1, map[string]string{
+			"code": strconv.FormatInt(int64(statusCode), 10),
+		})
+	}
 
 	return statusCode, err
 }
