@@ -400,6 +400,7 @@ func (g *generator) rpVMSS() *arm.Resource {
 		"rpMdsdConfigVersion",
 		"rpMdsdNamespace",
 		"rpParentDomainName",
+		// "fluentbitImage",
 		"databaseAccountName",
 		"keyvaultPrefix",
 		"keyvaultDNSSuffix",
@@ -446,6 +447,8 @@ func (g *generator) rpVMSS() *arm.Resource {
 	)
 
 	trailer := base64.StdEncoding.EncodeToString([]byte(`
+# TODO REMOVE - ljakubow
+export FLUENTIMAGE=arointsvc.azurecr.io/fluentbit:1.7.8-1
 yum -y update -x WALinuxAgent
 
 lvextend -l +50%FREE /dev/rootvg/rootlv
@@ -459,7 +462,6 @@ rm -f /var/lib/rpm/__db*
 
 rpm --import https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-7
 rpm --import https://packages.microsoft.com/keys/microsoft.asc
-rpm --import https://packages.fluentbit.io/fluentbit.key
 
 for attempt in {1..5}; do
   yum -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm && break
@@ -480,16 +482,8 @@ enabled=yes
 gpgcheck=no
 EOF
 
-cat >/etc/yum.repos.d/td-agent-bit.repo <<'EOF'
-[td-agent-bit]
-name=td-agent-bit
-baseurl=https://packages.fluentbit.io/centos/7/$basearch
-enabled=yes
-gpgcheck=yes
-EOF
-
 for attempt in {1..5}; do
-yum --enablerepo=rhui-rhel-7-server-rhui-optional-rpms -y install azsec-clamav azsec-monitor azure-cli azure-mdsd azure-security docker openssl-perl td-agent-bit && break
+yum --enablerepo=rhui-rhel-7-server-rhui-optional-rpms -y install azsec-clamav azsec-monitor azure-cli azure-mdsd azure-security docker openssl-perl && break
   if [[ ${attempt} -lt 5 ]]; then sleep 10; else exit 1; fi
 done
 
@@ -504,7 +498,25 @@ firewall-cmd --add-port=444/tcp --permanent
 firewall-cmd --add-port=445/tcp --permanent
 firewall-cmd --add-port=2222/tcp --permanent
 
-cat >/etc/td-agent-bit/td-agent-bit.conf <<'EOF'
+export AZURE_CLOUD_NAME=$AZURECLOUDNAME
+
+az login -i
+az account set -s "$SUBSCRIPTIONID"
+
+systemctl start docker.service
+az acr login --name "$(sed -e 's|.*/||' <<<"$ACRRESOURCEID")"
+
+MDMIMAGE="${RPIMAGE%%/*}/${MDMIMAGE##*/}"
+docker pull "$MDMIMAGE"
+docker pull "$RPIMAGE"
+docker pull "$FLUENTIMAGE"
+
+az logout
+
+mkdir -p /etc/fluentbit/
+mkdir -p /var/lib/fluent
+
+cat >/etc/fluentbit/fluentbit.conf <<'EOF'
 [INPUT]
 	Name systemd
 	Tag journald
@@ -527,19 +539,44 @@ cat >/etc/td-agent-bit/td-agent-bit.conf <<'EOF'
 	Port 29230
 EOF
 
-export AZURE_CLOUD_NAME=$AZURECLOUDNAME
+cat >/etc/sysconfig/fluentbit <<'EOF'
+FLUENTIMAGE='$FLUENTIMAGE'
 
-az login -i
-az account set -s "$SUBSCRIPTIONID"
+EOF
 
-systemctl start docker.service
-az acr login --name "$(sed -e 's|.*/||' <<<"$ACRRESOURCEID")"
+cat >/etc/systemd/system/fluentbit.service <<'EOF'
+[Unit]
+After=docker.service
+Requires=docker.service
+StartLimitIntervalSec=0
 
-MDMIMAGE="${RPIMAGE%%/*}/${MDMIMAGE##*/}"
-docker pull "$MDMIMAGE"
-docker pull "$RPIMAGE"
+[Service]
+RestartSec=1s
+EnvironmentFile=/etc/sysconfig/fluentbit
+ExecStartPre=-/usr/bin/docker rm -f %N
+ExecStartPre=-/usr/bin/docker pull $FLUENTIMAGE
+ExecStartPre=-mkdir -p /var/lib/fluent
+ExecStart=/usr/bin/docker run \
+  --entrypoint /opt/td-agent-bit/bin/td-agent-bit \
+  --net=host \
+  --hostname %H \
+  --name %N \
+  --rm \
+  -v /etc/fluentbit/fluentbit.conf:/etc/fluentbit/fluentbit.conf \
+  -v /var/lib/fluent:/var/lib/fluent:z \
+  -v /var/log/journal:/var/log/journal:z,ro \
+  -v /etc/machine-id:/etc/machine-id:ro \
+  $FLUENTIMAGE \
+  -c /etc/fluentbit/fluentbit.conf
 
-az logout
+ExecStop=/usr/bin/docker stop %N
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 mkdir /etc/aro-rp
 base64 -d <<<"$ADMINAPICABUNDLE" >/etc/aro-rp/admin-ca-bundle.pem
@@ -900,7 +937,7 @@ mkdir -p /usr/lib/ssl/certs
 csplit -f /usr/lib/ssl/certs/cert- -b %03d.pem /etc/pki/tls/certs/ca-bundle.crt /^$/1 {*} >/dev/null
 c_rehash /usr/lib/ssl/certs
 
-for service in aro-dbtoken aro-monitor aro-portal aro-rp auoms azsecd azsecmond mdsd mdm chronyd td-agent-bit; do
+for service in aro-dbtoken aro-monitor aro-portal aro-rp auoms azsecd azsecmond mdsd mdm chronyd fluentbit; do
   systemctl enable $service.service
 done
 
